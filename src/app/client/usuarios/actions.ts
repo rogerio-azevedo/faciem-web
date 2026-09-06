@@ -3,11 +3,8 @@
 import { revalidatePath } from 'next/cache';
 import { z } from 'zod';
 
-import { auth } from '@/auth';
-
 import {
     apiFetchAuthed,
-    getApiBaseUrl,
     nestErrorMessage,
     parseResponseJson,
 } from '@/lib/api-fetch';
@@ -202,17 +199,52 @@ export async function getClientRegistrationFaceSyncStatusAction(
     }
 }
 
-export async function getClientFaceSyncProgressSseUrlAction(): Promise<
-    { url: string } | { error: string }
+export async function enqueueClientFaceSyncAllAction(
+    force = false,
+): Promise<
+    { ok: true; queued: number; force: boolean } | { ok: false; error: string }
 > {
     try {
-        const session = await auth();
-        const token = session?.accessToken;
-        if (!token) return { error: 'Não autenticado.' };
-        const base = getApiBaseUrl();
-        const url = `${base}/api/client/faces/sync-all/progress?token=${encodeURIComponent(token)}`;
-        return { url };
+        const res = await apiFetchAuthed('/api/client/faces/sync-all', {
+            method: 'POST',
+            body: JSON.stringify({ force }),
+        });
+        const data = (await parseResponseJson(res)) as {
+            queued?: number;
+            force?: boolean;
+        };
+        if (!res.ok) return { ok: false, error: nestErrorMessage(data) };
+        return {
+            ok: true,
+            queued: Number(data.queued ?? 0),
+            force: data.force === true,
+        };
     } catch {
-        return { error: 'Não autenticado.' };
+        return { ok: false, error: 'Erro de comunicação.' };
+    }
+}
+
+export async function getClientFaceSyncStatusAction(): Promise<
+    | { ok: true; data: { queued: number; running: number } }
+    | { ok: false; error: string }
+> {
+    try {
+        const res = await apiFetchAuthed('/api/client/faces/sync-status', {
+            cache: 'no-store',
+        });
+        const data = (await parseResponseJson(res)) as {
+            queued?: number;
+            running?: number;
+        };
+        if (!res.ok) return { ok: false, error: nestErrorMessage(data) };
+        return {
+            ok: true,
+            data: {
+                queued: Number(data.queued ?? 0),
+                running: Number(data.running ?? 0),
+            },
+        };
+    } catch {
+        return { ok: false, error: 'Erro de comunicação.' };
     }
 }

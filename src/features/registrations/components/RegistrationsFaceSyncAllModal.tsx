@@ -1,21 +1,16 @@
 "use client";
 
-import {
-    CheckCircle2,
-    Loader2,
-    RefreshCw,
-    TriangleAlert,
-    XCircle,
-} from "lucide-react";
+import { Loader2, RefreshCw } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useCallback, useState } from "react";
+import { useCallback, useState, useTransition } from "react";
 import { toast } from "sonner";
 
-import { getClientFaceSyncProgressSseUrlAction } from "@/app/client/usuarios/actions";
-import { getCompanyFaceSyncProgressSseUrlAction } from "@/app/company/clientes/[clientId]/usuarios/actions";
+import { enqueueClientFaceSyncAllAction } from "@/app/client/usuarios/actions";
+import { enqueueCompanyFaceSyncAllAction } from "@/app/company/clientes/[clientId]/usuarios/actions";
 import {
     AlertDialog,
     AlertDialogAction,
+    AlertDialogCancel,
     AlertDialogContent,
     AlertDialogDescription,
     AlertDialogFooter,
@@ -24,269 +19,125 @@ import {
     AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { humanizeDeviceSyncError } from "@/lib/face-sync-result";
-import { useGlobalFaceSync } from "@/lib/use-global-face-sync";
-import { cn } from "@/lib/utils";
+import { useRegistrationBatchSync } from "@/features/registrations/hooks/use-registration-batch-sync";
 
 type RegistrationsFaceSyncAllModalProps = {
     variant: "client" | "company";
     companyClientId?: string;
 };
 
-function progressPercent(processed: number, total: number): number {
-    if (total <= 0) return 0;
-    return Math.min(100, Math.round((processed / total) * 100));
-}
-
 export function RegistrationsFaceSyncAllModal({
     variant,
     companyClientId,
 }: RegistrationsFaceSyncAllModalProps) {
     const router = useRouter();
-    const { phase, progress, items, errorMessage, start, reset, cancel } =
-        useGlobalFaceSync();
     const [open, setOpen] = useState(false);
+    const [pending, startTransition] = useTransition();
 
-    const isActive = phase === "connecting" || phase === "running";
-    const failedItems = items.filter((item) => !item.ok);
+    const handleFinished = useCallback(() => {
+        toast.success("Sincronização concluída em segundo plano.");
+        router.refresh();
+    }, [router]);
 
-    const handleOpenChange = useCallback(
-        (nextOpen: boolean) => {
-            if (!nextOpen) {
-                if (isActive) cancel();
-                else reset();
-                if (phase === "done") router.refresh();
-            }
-            setOpen(nextOpen);
+    const { syncBusy, queued, running, refetch } = useRegistrationBatchSync({
+        variant,
+        companyClientId,
+        onFinished: handleFinished,
+    });
+
+    const inQueue = queued + running;
+    const busy = syncBusy || pending;
+
+    const handleStart = useCallback(
+        (force: boolean) => {
+            setOpen(false);
+            startTransition(async () => {
+                const result =
+                    variant === "client"
+                        ? await enqueueClientFaceSyncAllAction(force)
+                        : await enqueueCompanyFaceSyncAllAction(
+                              companyClientId ?? "",
+                              force,
+                          );
+                if (!result.ok) {
+                    toast.error(result.error);
+                    return;
+                }
+                await refetch();
+                if (result.queued === 0) {
+                    toast.message(
+                        force
+                            ? "Nenhum cadastro aprovado com foto para sincronizar."
+                            : "Nenhum cadastro pendente de sincronização.",
+                    );
+                    return;
+                }
+                toast.success("Sync enfileirado. Pode sair desta tela.");
+            });
         },
-        [cancel, isActive, phase, reset, router],
+        [companyClientId, refetch, variant],
     );
 
-    const handleStart = useCallback(async () => {
-        const urlResult =
-            variant === "client"
-                ? await getClientFaceSyncProgressSseUrlAction()
-                : await getCompanyFaceSyncProgressSseUrlAction(
-                      companyClientId ?? "",
-                  );
-
-        if ("error" in urlResult) {
-            toast.error(urlResult.error);
-            return;
-        }
-
-        start(urlResult.url);
-    }, [companyClientId, start, variant]);
-
-    const handleClose = useCallback(() => {
-        if (isActive) cancel();
-        else reset();
-        setOpen(false);
-        if (phase === "done") router.refresh();
-    }, [cancel, isActive, phase, reset, router]);
-
-    const pct = progressPercent(progress.processed, progress.total);
-
     return (
-        <>
+        <div className="flex flex-col items-stretch gap-2 sm:items-end">
             <Button
                 type="button"
                 variant="outline"
                 size="default"
                 className="gap-2 shrink-0"
-                disabled={isActive}
-                onClick={() => {
-                    reset();
-                    setOpen(true);
-                    void handleStart();
-                }}
+                disabled={busy}
+                onClick={() => setOpen(true)}
             >
-                {isActive ? (
+                {busy ? (
                     <Loader2 className="size-4 animate-spin" />
                 ) : (
                     <RefreshCw className="size-4" />
                 )}
                 Sincronizar todos no leitor
             </Button>
+            {syncBusy ? (
+                <p className="text-muted-foreground flex items-center gap-1.5 text-xs">
+                    <Loader2 className="size-3.5 shrink-0 animate-spin" />
+                    Sincronizando cadastros — {inQueue} na fila
+                    <span>· pode sair desta tela</span>
+                </p>
+            ) : null}
 
-            <AlertDialog open={open} onOpenChange={handleOpenChange}>
+            <AlertDialog open={open} onOpenChange={setOpen}>
                 <AlertDialogContent className="max-w-md sm:max-w-md">
-                    {phase === "connecting" || phase === "running" ? (
-                        <AlertDialogHeader className="place-items-start text-left">
-                            <AlertDialogMedia className="bg-muted mb-0">
-                                <Loader2 className="size-6 animate-spin" />
-                            </AlertDialogMedia>
-                            <AlertDialogTitle>
-                                Sincronizar faces nos leitores
-                            </AlertDialogTitle>
-                            <div className="w-full space-y-4 text-left">
-                                <p className="text-muted-foreground text-sm">
-                                    Envia cada cadastro aprovado pendente para
-                                    todos os leitores ativos deste cliente.
-                                </p>
-                                <div className="space-y-2">
-                                    <div className="flex justify-between text-sm">
-                                        <span>
-                                            {progress.processed} de{" "}
-                                            {progress.total || "…"} concluídos
-                                        </span>
-                                        <span className="text-muted-foreground">
-                                            {pct}%
-                                        </span>
-                                    </div>
-                                    <div className="bg-muted h-2 overflow-hidden rounded-full">
-                                        <div
-                                            className="bg-primary h-full transition-all duration-300"
-                                            style={{ width: `${pct}%` }}
-                                        />
-                                    </div>
-                                </div>
-                                <p className="text-muted-foreground text-xs">
-                                    Sucesso: {progress.synced} · Falhas:{" "}
-                                    {progress.failed}
-                                </p>
-                                {failedItems.length > 0 ? (
-                                    <FailedItemsList items={failedItems} />
-                                ) : null}
-                            </div>
-                        </AlertDialogHeader>
-                    ) : null}
-
-                    {phase === "done" ? (
-                        <>
-                            <AlertDialogHeader className="place-items-start text-left">
-                                <AlertDialogMedia
-                                    className={cn(
-                                        "mb-0",
-                                        progress.failed > 0
-                                            ? "bg-amber-100 text-amber-700"
-                                            : "bg-emerald-100 text-emerald-700",
-                                    )}
-                                >
-                                    {progress.failed > 0 ? (
-                                        <TriangleAlert className="size-6" />
-                                    ) : (
-                                        <CheckCircle2 className="size-6" />
-                                    )}
-                                </AlertDialogMedia>
-                                <AlertDialogTitle>
-                                    {progress.failed > 0
-                                        ? "Sincronização concluída com falhas"
-                                        : "Sincronização concluída"}
-                                </AlertDialogTitle>
-                                <AlertDialogDescription className="sr-only">
-                                    Sync em lote finalizado.
-                                </AlertDialogDescription>
-                                <div className="space-y-2 text-left text-sm">
-                                    <p>
-                                        {progress.synced} cadastro(s)
-                                        sincronizado(s) com sucesso
-                                        {progress.failed > 0
-                                            ? ` · ${progress.failed} com falha`
-                                            : ""}
-                                        .
-                                    </p>
-                                    {progress.total === 0 ? (
-                                        <p className="text-muted-foreground">
-                                            Nenhum cadastro pendente de
-                                            sincronização.
-                                        </p>
-                                    ) : null}
-                                    {failedItems.length > 0 ? (
-                                        <FailedItemsList items={failedItems} />
-                                    ) : null}
-                                </div>
-                            </AlertDialogHeader>
-                            <AlertDialogFooter>
-                                <AlertDialogAction onClick={handleClose}>
-                                    Fechar
-                                </AlertDialogAction>
-                            </AlertDialogFooter>
-                        </>
-                    ) : null}
-
-                    {phase === "error" ? (
-                        <>
-                            <AlertDialogHeader className="place-items-start text-left">
-                                <AlertDialogMedia
-                                    className={cn(
-                                        "mb-0",
-                                        progress.synced > 0
-                                            ? "bg-amber-100 text-amber-700"
-                                            : "bg-destructive/10 text-destructive",
-                                    )}
-                                >
-                                    {progress.synced > 0 ? (
-                                        <TriangleAlert className="size-6" />
-                                    ) : (
-                                        <XCircle className="size-6" />
-                                    )}
-                                </AlertDialogMedia>
-                                <AlertDialogTitle>
-                                    {progress.synced > 0
-                                        ? "Sincronização interrompida"
-                                        : "Falha na sincronização"}
-                                </AlertDialogTitle>
-                                <AlertDialogDescription className="sr-only">
-                                    Erro durante o sync em lote.
-                                </AlertDialogDescription>
-                                <div className="space-y-2 text-left text-sm">
-                                    <p className="text-muted-foreground">
-                                        {errorMessage ??
-                                            "Ocorreu um erro durante a sincronização."}
-                                    </p>
-                                    {progress.processed > 0 ? (
-                                        <p>
-                                            Processados antes da interrupção:{" "}
-                                            {progress.processed} (
-                                            {progress.synced} ok,{" "}
-                                            {progress.failed} falha).
-                                        </p>
-                                    ) : null}
-                                    {failedItems.length > 0 ? (
-                                        <FailedItemsList items={failedItems} />
-                                    ) : null}
-                                </div>
-                            </AlertDialogHeader>
-                            <AlertDialogFooter>
-                                <AlertDialogAction onClick={handleClose}>
-                                    Fechar
-                                </AlertDialogAction>
-                            </AlertDialogFooter>
-                        </>
-                    ) : null}
+                    <AlertDialogHeader className="place-items-start text-left">
+                        <AlertDialogMedia className="bg-muted mb-0">
+                            <RefreshCw className="size-6" />
+                        </AlertDialogMedia>
+                        <AlertDialogTitle>
+                            Sincronizar cadastros nos leitores
+                        </AlertDialogTitle>
+                        <AlertDialogDescription>
+                            Enfileira cadastros aprovados com foto para todos os
+                            leitores ativos. O trabalho segue em segundo plano
+                            — você pode sair desta tela. Use forçar se os
+                            usuários foram apagados no IVS ou no equipamento.
+                        </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter className="sm:flex-col sm:items-stretch">
+                        <AlertDialogCancel>Cancelar</AlertDialogCancel>
+                        <Button
+                            type="button"
+                            variant="outline"
+                            disabled={pending}
+                            onClick={() => handleStart(false)}
+                        >
+                            Sincronizar pendentes
+                        </Button>
+                        <AlertDialogAction
+                            disabled={pending}
+                            onClick={() => handleStart(true)}
+                        >
+                            Forçar reenvio de todos
+                        </AlertDialogAction>
+                    </AlertDialogFooter>
                 </AlertDialogContent>
             </AlertDialog>
-        </>
-    );
-}
-
-function FailedItemsList({
-    items,
-}: {
-    items: { label: string; ok: boolean; error?: string }[];
-}) {
-    return (
-        <div className="bg-destructive/5 max-h-40 space-y-1.5 overflow-y-auto rounded-md border border-destructive/20 p-2.5">
-            <p className="text-destructive text-xs font-medium">
-                Erros de sincronização
-            </p>
-            <ul className="space-y-1">
-                {items.map((item, index) => (
-                    <li
-                        key={`${item.label}-${index}`}
-                        className="text-destructive text-xs"
-                    >
-                        <span className="font-medium">{item.label}</span>
-                        {item.error ? (
-                            <span className="text-destructive/80">
-                                {" "}
-                                — {humanizeDeviceSyncError(item.error)}
-                            </span>
-                        ) : null}
-                    </li>
-                ))}
-            </ul>
         </div>
     );
 }
